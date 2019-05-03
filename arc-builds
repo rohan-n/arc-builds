@@ -1,0 +1,260 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import json
+import requests
+from enum import Enum
+from os.path import expanduser
+
+from colorama import Fore, Style
+from concurrent.futures import as_completed, ThreadPoolExecutor
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any, Dict, Optional, List, Tuple  # noqa: F401
+
+    PHID = str  # noqa: F401
+
+# Declare these upfront to save time on computing
+REVISION_NEEDS_REVISION = Fore.RED + "Needs Revision" + Fore.RESET
+REVISION_ACCEPTED = Fore.GREEN + "Accepted" + Fore.RESET
+REVISION_NEEDS_REVIEW = Fore.MAGENTA + "Needs Review" + Fore.RESET
+# TODO: what color is this in `arc`
+REVISION_PUBLISHED = "Published" + Fore.RESET
+
+BUILDABLE_PASSED = Fore.GREEN + "[✔]"
+BUILDABLE_FAILED = Fore.RED + "[✘]"
+BUILDABLE_BUILDING = Fore.YELLOW + "[-]"
+
+
+class ArcBuildsException(Exception):
+    def __init__(self, error_code, error_info):
+        # type: (str, str) -> None
+        self.error_code = error_code
+        self.error_info = error_info
+        super(ArcBuildsException, self).__init__(
+            "{error_code}: {error_info}"
+            .format(error_code=error_code, error_info=error_info)
+        )
+
+
+class BaseObject(object):
+    def __repr__(self):
+        # type: () -> str
+        attributes = (
+            "{attr}={value}".format(attr=k, value=v)
+            for k, v in self.__dict__.items()
+        )
+        return (
+            "{class_name}({attributes})"
+            .format(
+                class_name=self.__class__.__name__,
+                attributes=', '.join(attributes)
+            )
+        )
+
+
+class User(BaseObject):
+    def __init__(
+            self,
+            phid,  # type: PHID
+    ):
+        # type: (...) -> None
+        self.phid = phid
+
+
+class Revision(BaseObject):
+    def __init__(
+            self,
+            id,           # type: int
+            phid,         # type: PHID
+            title,        # type: str
+            author_phid,  # type: PHID
+            status,       # type: RevisionStatus
+            diff_phid,    # type: PHID
+            created,      # type: int
+            modified,     # type: int
+    ):
+        # type: (...) -> None
+        self.id = id
+        self.phid = phid
+        self.title = title
+        self.author_phid = author_phid
+        self.status = status
+        self.diff_phid = diff_phid
+        self.created = created
+        self.modified = modified
+
+
+class RevisionStatus(Enum):
+    needs_revision = "needs-revision"
+    needs_review = "needs-review"
+    accepted = "accepted"
+    published = "published"
+
+
+class Buildable(BaseObject):
+    def __init__(
+            self,
+            phid,         # type: PHID
+            object_phid,  # type: PHID
+            status,       # type: BuildableStatus
+            # created,      # type: datetime
+            # modified,     # type: datetime
+    ):
+        # type: (...) -> None
+        self.phid = phid
+        self.object_phid = object_phid
+        self.status = status
+        # self.created = created
+        # self.modified = modified
+
+
+class BuildableStatus(Enum):
+    passed = "passed"
+    failed = "failed"
+    building = "building"
+
+
+class PhabricatorClient(object):
+    def __init__(self, api_token):
+        self.api_token = api_token
+
+    # TODO: make method_name enum or class with data and this method formats the class into the request
+    def _fetch_phab_data(self, method_name, data=None):
+        # type: (str, Optional[Dict[str, Any]]) -> Dict[str, Any]
+        api_endpoint = "https://phabricator.team.affirm.com/api/{}".format(method_name)
+        data = data or {}
+        data["api.token"] = self.api_token
+
+        response = requests.post(api_endpoint, data=data)
+        data = response.json()
+        error_code = data["error_code"]
+        error_info = data["error_info"]
+        if error_code:
+            raise ArcBuildsException(error_code, error_info)
+        return data["result"]
+
+    def get_user(self):
+        # type: () -> User
+        result = self._fetch_phab_data("user.whoami")
+        return User(
+            phid=result["phid"],
+        )
+
+    def get_authored_revisions(self, author_phid, limit=20):
+        # type: (PHID, int) -> List[Revision]
+        result = self._fetch_phab_data("differential.revision.search", data={
+            "constraints[authorPHIDs][0]": author_phid,
+            "limit": limit,
+        })
+        revisions = []
+        for data in result["data"]:
+            revision = Revision(
+                id=data["id"],
+                phid=data["phid"],
+                title=data["fields"]["title"],
+                author_phid=data["fields"]["authorPHID"],
+                status=RevisionStatus(data["fields"]["status"]["value"]),  # TODO: what is closed?
+                diff_phid=data["fields"]["diffPHID"],
+                created=data["fields"]["dateCreated"],
+                modified=data["fields"]["dateModified"],
+            )
+            revisions.append(revision)
+        return revisions
+
+    def get_buildables(self, object_phid, limit=20):
+        # type: (PHID, int) -> List[Buildable]
+        result = self._fetch_phab_data("harbormaster.buildable.search", data={
+            "constraints[objectPHIDs][0]": object_phid,
+            "limit": limit,
+        })
+        buildables = []
+        for data in result["data"]:
+            buildable = Buildable(
+                phid=data["phid"],
+                object_phid=data["fields"]["objectPHID"],
+                status=BuildableStatus(data["fields"]["buildableStatus"]["value"]),  # TODO: what is closed?
+            )
+            buildables.append(buildable)
+        return buildables
+
+
+def get_api_token():
+    # type: () -> str
+    fpath = expanduser("~/.arcrc")
+    with open(fpath) as f:
+        config = json.loads(f.read())
+
+    token = None
+    for host, host_config in config.get("hosts", {}).items():
+        token = host_config.get("token")
+        if token is not None:
+            return token
+
+
+def format_revision_status(status):
+    # type: (RevisionStatus) -> str
+    if status == RevisionStatus.accepted:
+        return REVISION_ACCEPTED
+    if status == RevisionStatus.needs_review:
+        return REVISION_NEEDS_REVIEW
+    # TODO: what color is this in `arc`
+    if status == RevisionStatus.published:
+        return REVISION_PUBLISHED
+    if status == RevisionStatus.needs_revision:
+        return REVISION_NEEDS_REVISION
+    raise ValueError(status)
+
+
+def format_buildable_status(status):
+    # type: (BuildableStatus) -> str
+    if status == BuildableStatus.passed:
+        return BUILDABLE_PASSED
+    if status == BuildableStatus.failed:
+        return BUILDABLE_FAILED
+    if status == BuildableStatus.building:
+        return BUILDABLE_BUILDING
+    raise ValueError(status)
+
+
+api_token = get_api_token()
+client = PhabricatorClient(api_token)
+user = client.get_user()
+revisions = client.get_authored_revisions(user.phid)
+
+outputs = []
+with ThreadPoolExecutor() as executor:
+    def get_buildable_helper(revision):
+        # type: (Revision) -> Tuple[Revision, Buildable]
+        """Wrapper for ``get_buildables`` which returns the buildable with the revision.
+        """
+        # should only be exactly one buildable for an unpublished revision
+        buildable, = client.get_buildables(revision.diff_phid)
+        return (revision, buildable)
+
+    futures = [
+        executor.submit(get_buildable_helper, revision)
+        for revision in revisions
+        if revision.status != RevisionStatus.published
+    ]
+    for future in as_completed(futures):
+        revision, buildable = future.result()
+        output = (
+            # TODO: dynamically figure out the best justify rules
+            "{buildable_status:<3} {revision_status:<24} {bold}D{revision_id}:{reset} {revision_title}"
+            .format(
+                buildable_status=format_buildable_status(buildable.status),
+                revision_status=format_revision_status(revision.status),
+                revision_id=revision.id,
+                revision_title=revision.title,
+                bold=Style.BRIGHT,
+                reset=Style.RESET_ALL,
+            )
+        )
+        outputs.append((output, revision))
+
+# TODO: figure out how `arc list` sorts
+sorted_outputs = sorted(outputs, key=lambda o: (o[1].status.value, o[1].created))
+outputs = [o for (o, _) in sorted_outputs]
+print "\n".join(outputs)
