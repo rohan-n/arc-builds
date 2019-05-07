@@ -13,3 +13,8 @@ git clone https://github.com/kaybinwang/arc-builds
 cd arc-builds
 arc alias builds '!'"$(pwd -P)"'/arc-builds'
 ```
+
+After this, you should be able to list your Phabricator revisions with
+```bash
+arc builds
+```
